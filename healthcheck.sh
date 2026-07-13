@@ -19,21 +19,6 @@
 # Usage:  bash health_check.sh
 # =============================================================================
 
-# Azure Blob Storage destination for encrypted health reports.
-# The storage account and container were created with:
-#   az group create   --name rg-healthcheck-reports --location eastus
-#   az storage account create --name sahealthchk42731 --resource-group rg-healthcheck-reports \
-#     --sku Standard_LRS --kind StorageV2 --https-only true \
-#     --min-tls-version TLS1_2 --allow-blob-public-access false
-#   az storage container create --name health-reports --account-name sahealthchk42731
-#
-# WARNING: the key below is a static credential.  Rotate it if it is ever
-# exposed, and consider replacing it with a short-lived SAS token or managed
-# identity in production environments.
-STORAGE_ACCOUNT_NAME="sahealthchk42731"
-STORAGE_ACCOUNT_KEY="$1"
-STORAGE_CONTAINER="health-reports"
-
 # Semantic version of this script; included in every report for traceability.
 SCRIPT_VERSION="1.0.0"
 
@@ -49,7 +34,7 @@ CPU_SAMPLE_SECONDS=1
 # Prints a UTC-timestamped status line to stderr so that progress messages
 # remain separate from any stdout data used in command substitutions.
 log() {
-    printf '[%s] %s\n' "$(date -u +'%H:%M:%S' 2>/dev/null || echo '??:??:??')" "$*"
+    printf '[%s] %s\n' "$(date -u +'%H:%M:%S' 2>/dev/null || echo '??:??:??')" "$*" >&2
 }
 
 # safe_read <path>
@@ -69,7 +54,6 @@ trim() { awk '{$1=$1}1' 2>/dev/null || true; }
 json_str() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'; }
 
 log "Ubuntu health check v${SCRIPT_VERSION} – starting"
-log "Destination: ${STORAGE_ACCOUNT_NAME}/${STORAGE_CONTAINER} (Azure Blob Storage)"
 log "Collecting health data..."
 
 # =============================================================================
@@ -793,9 +777,6 @@ bxfE8RRm+hW9xP3c5n44F40CAwEAAQ==
 -----END PUBLIC KEY-----
 PUBKEYEOF
 
-# DEBUG: copy plaintext report before encryption
-cp "${HC_TMP}/report.json" /tmp/debug_report.json 2>/dev/null || true
-
 # Generate a fresh random AES-256 key (32 bytes) and IV (16 bytes) as raw binary.
 # A unique key+IV pair is produced on every script invocation.
 openssl rand 32 > "${HC_TMP}/aes.key" 2>/dev/null \
@@ -840,45 +821,13 @@ ENC_KEY=$(base64 -w0 < "${HC_TMP}/keyiv.enc") \
 ENC_DATA=$(base64 -w0 < "${HC_TMP}/report.enc") \
     || { log "ERROR: base64 of encrypted data failed."; exit 1; }
 
-# Build the JSON envelope and write it into the temp directory so that
-# az storage blob upload can read it from a file path.
-# base64 output is A-Za-z0-9+/= only -- safe to embed directly in printf.
-printf '{"algorithm":"RSA-OAEP-SHA256 + AES-256-CBC","encrypted_key":"%s","encrypted_data":"%s"}' \
-    "${ENC_KEY}" "${ENC_DATA}" \
-    > "${HC_TMP}/envelope.json" \
-    || { log "ERROR: Cannot write envelope to temp file."; exit 1; }
-
-# Unique blob name: <short-hostname>_<UTC-timestamp>.json.enc
-BLOB_NAME="$(hostname -s 2>/dev/null || echo unknown)_$(date -u +%Y%m%dT%H%M%SZ).json.enc"
-
-log "Uploading to ${STORAGE_ACCOUNT_NAME}/${STORAGE_CONTAINER}..."
-
-# When running inside WSL the 'az' on PATH is the Windows CLI, which cannot
-# resolve WSL-native paths.  Convert /tmp/... to the \\wsl.localhost\... UNC
-# equivalent so the Windows process can open the file.
-_UPLOAD_FILE="${HC_TMP}/envelope.json"
-if command -v wslpath >/dev/null 2>&1; then
-    _UPLOAD_FILE=$(wslpath -w "${HC_TMP}/envelope.json" 2>/dev/null) \
-        || _UPLOAD_FILE="${HC_TMP}/envelope.json"
-fi
-
-az storage blob upload \
-    --account-name   "${STORAGE_ACCOUNT_NAME}" \
-    --account-key    "${STORAGE_ACCOUNT_KEY}" \
-    --container-name "${STORAGE_CONTAINER}" \
-    --file           "${_UPLOAD_FILE}" \
-    --name           "${BLOB_NAME}" \
-    --content-type   "application/json" \
-    --auth-mode      key \
-    --overwrite \
-    --no-progress \
-    --only-show-errors \
-    --output none \
-    || { log "ERROR: az storage blob upload failed."; exit 1; }
-
-# Wipe all crypto material now that the upload has completed.
+# Wipe all crypto material from disk before writing to stdout.
 rm -rf "${HC_TMP}"
 trap - EXIT
 
-log "Upload successful: ${BLOB_NAME}"
-log "Health check complete."
+# Output the encrypted envelope JSON to stdout.
+# stdout contains only this line; all progress messages were sent to stderr.
+printf '{"algorithm":"RSA-OAEP-SHA256 + AES-256-CBC","encrypted_key":"%s","encrypted_data":"%s"}\n' \
+    "${ENC_KEY}" "${ENC_DATA}"
+
+log "Done."
